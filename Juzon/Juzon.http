@@ -1,0 +1,6 @@
+@Juzon_HostAddress = http://localhost:5047
+
+GET {{Juzon_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
