@@ -30,19 +30,19 @@ namespace Juzon.Services
             Directory.CreateDirectory(tempFolder);
 
             string outputTemplate = Path.Combine(tempFolder, "%(title)s.%(ext)s");
-            string ytDlpPath = Path.Combine(AppContext.BaseDirectory, "Tools", "yt-dlp.exe");
-            string ffmpegPath = Path.Combine(AppContext.BaseDirectory, "Tools", "ffmpeg.exe");
-            string ffprobePath = Path.Combine(AppContext.BaseDirectory, "Tools", "ffprobe.exe");
-
+            string toolsFolder = Path.Combine(AppContext.BaseDirectory, "Tools");
+            string ytDlpPath = Path.Combine(toolsFolder, "yt-dlp.exe");
+            string ffmpegPath = Path.Combine(toolsFolder, "ffmpeg.exe");
+            string ffprobePath = Path.Combine(toolsFolder, "ffprobe.exe");
 
             if (!File.Exists(ytDlpPath))
-                throw new FileNotFoundException("yt-dlp.exe not found", ytDlpPath);
+                throw new FileNotFoundException("yt-dlp.exe not found.", ytDlpPath);
 
             if (!File.Exists(ffmpegPath))
-                throw new FileNotFoundException($"ffmpeg.exe was not found at: {ffmpegPath}");
+                throw new FileNotFoundException("ffmpeg.exe was not found.", ffmpegPath);
 
             if (!File.Exists(ffprobePath))
-                throw new FileNotFoundException($"ffprobe.exe was not found at: {ffprobePath}");
+                throw new FileNotFoundException("ffprobe.exe was not found.", ffprobePath);
 
             var psi = new ProcessStartInfo
             {
@@ -53,6 +53,16 @@ namespace Juzon.Services
                 CreateNoWindow = true,
                 WorkingDirectory = tempFolder
             };
+
+            // Tell yt-dlp where ffmpeg and ffprobe are
+            psi.ArgumentList.Add("--ffmpeg-location");
+            psi.ArgumentList.Add(toolsFolder);
+
+            // Important: never download playlists
+            psi.ArgumentList.Add("--no-playlist");
+
+            // Better output stability
+            psi.ArgumentList.Add("--restrict-filenames");
 
             if (format == "mp3")
             {
@@ -78,7 +88,6 @@ namespace Juzon.Services
             psi.ArgumentList.Add("-o");
             psi.ArgumentList.Add(outputTemplate);
 
-            psi.ArgumentList.Add("--no-playlist");
             psi.ArgumentList.Add(url);
 
             using var process = new Process { StartInfo = psi };
@@ -88,17 +97,34 @@ namespace Juzon.Services
             string stdOut = await process.StandardOutput.ReadToEndAsync(ct);
             string stdErr = await process.StandardError.ReadToEndAsync(ct);
 
-            await process.WaitForExitAsync(ct); 
-            
-            //if (process.ExitCode != 0)
-            //{
-            //    _logger.LogError(
-            //        "yt-dlp failed. ExitCode={ExitCode}. Output={Output}. Error={Error}",
-            //        process.ExitCode, stdOut, stdErr);
+            await process.WaitForExitAsync(ct);
 
-            //    throw new InvalidOperationException(
-            //        string.IsNullOrWhiteSpace(stdErr) ? "Conversion failed." : stdErr);
-            //}
+            if (process.ExitCode != 0)
+            {
+                _logger.LogError(
+                    "yt-dlp failed. ExitCode={ExitCode}. Url={Url}. Output={Output}. Error={Error}",
+                    process.ExitCode, url, stdOut, stdErr);
+
+                string errorText = (stdErr + Environment.NewLine + stdOut).ToLowerInvariant();
+
+                if (errorText.Contains("unsupported url"))
+                    throw new ArgumentException("Only valid YouTube video links are allowed.");
+
+                if (errorText.Contains("video unavailable"))
+                    throw new ArgumentException("This YouTube video is unavailable.");
+
+                if (errorText.Contains("private video"))
+                    throw new ArgumentException("This YouTube video is private.");
+
+                if (errorText.Contains("sign in to confirm your age"))
+                    throw new ArgumentException("This YouTube video is age-restricted and cannot be processed.");
+
+                if (errorText.Contains("unable to extract"))
+                    throw new ArgumentException("Could not read this YouTube video link.");
+
+                throw new InvalidOperationException(
+                    string.IsNullOrWhiteSpace(stdErr) ? "Conversion failed." : stdErr);
+            }
 
             string extension = format == "mp3" ? ".mp3" : ".mp4";
 

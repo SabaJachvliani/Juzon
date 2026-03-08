@@ -1,17 +1,54 @@
+using Juzon.Exceptions;
 using Juzon.Models;
 using Juzon.Services;
+using Juzon.Tools;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
-
 builder.Services.AddControllers();
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
 builder.Services.AddScoped<IVideoConverterService, VideoConverterService>();
 
+builder.Services.AddProblemDetails();
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.OnRejected = async (context, token) =>
+    {
+        context.HttpContext.Response.ContentType = "application/json";
+
+        await context.HttpContext.Response.WriteAsJsonAsync(new
+        {
+            message = "Too many requests. Please try again later."
+        }, cancellationToken: token);
+    };
+
+    options.AddPolicy("convert-policy", httpContext =>
+    {
+        var ip = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: ip,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 3,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                AutoReplenishment = true
+            });
+    });
+});
+
 var app = builder.Build();
+
+app.UseExceptionHandler();
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -25,11 +62,13 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
+app.UseRateLimiter();
+
 app.UseAuthorization();
 
 app.MapControllers();
 
-app.MapGet("/", () => Results.Ok("YoutubeConverterApi is running."));
+
 
 app.MapPost("/convert", async (
     ConvertRequest request,
@@ -42,28 +81,32 @@ app.MapPost("/convert", async (
     if (string.IsNullOrWhiteSpace(request.Url))
         return Results.BadRequest("Url is required.");
 
-    if (request.Format is not ("mp3" or "mp4"))
+    var format = request.Format?.Trim().ToLowerInvariant();
+
+    if (format is not ("mp3" or "mp4"))
         return Results.BadRequest("Format must be mp3 or mp4.");
 
-    try
+    if (!YouTubeUrlValidator.TryGetVideoId(request.Url, out var videoId))
     {
-        var result = await service.ConvertAsync(request.Url, request.Format, ct);
+        return Results.BadRequest(
+            "Please provide a valid YouTube video link. Example: https://www.youtube.com/watch?v=VIDEO_ID");
+    }
 
-        var stream = new FileStream(result.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+    var cleanUrl = $"https://www.youtube.com/watch?v={videoId}";
 
-        return Results.File(
-            stream,
-            contentType: result.ContentType,
-            fileDownloadName: result.FileName);
-    }
-    catch (ArgumentException ex)
-    {
-        return Results.BadRequest(ex.Message);
-    }
-    catch (Exception ex)
-    {
-        return Results.Problem(ex.Message);
-    }
-});
+    var result = await service.ConvertAsync(cleanUrl, format, ct);
+
+    var stream = new FileStream(
+        result.FilePath,
+        FileMode.Open,
+        FileAccess.Read,
+        FileShare.Read);
+
+    return Results.File(
+        stream,
+        contentType: result.ContentType,
+        fileDownloadName: result.FileName);
+})
+.RequireRateLimiting("convert-policy");
 
 app.Run();
